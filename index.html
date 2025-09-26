@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Collaborative Whiteboard</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Firebase/Firestore -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, setPersistence, browserSessionPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, getDocs, deleteDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global Firebase variables will be defined here (db, auth, appId)
+        window.firebaseApp = {};
+
+        // --- Firebase Setup ---
+        const setupFirebase = async () => {
+            try {
+                // Mandatory Global Variables provided by the environment
+                const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+                const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+                const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+                setLogLevel('Debug'); // Enable Firestore logging
+
+                const app = initializeApp(firebaseConfig);
+                const db = getFirestore(app);
+                const auth = getAuth(app);
+
+                // Set session persistence
+                await setPersistence(auth, browserSessionPersistence);
+
+                // Sign in using the provided custom token or anonymously
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                // Wait for auth state to be ready
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        const userId = user.uid;
+                        document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+
+                        // Store global references
+                        window.firebaseApp.db = db;
+                        window.firebaseApp.auth = auth;
+                        window.firebaseApp.userId = userId;
+                        window.firebaseApp.appId = appId;
+
+                        // Start the whiteboard application logic
+                        initWhiteboard(db, appId, userId);
+
+                    } else {
+                        console.error("Authentication failed or not ready.");
+                        document.getElementById('loading-status').textContent = 'Error loading application. Check console for details.';
+                    }
+                });
+            } catch (error) {
+                console.error("Firebase setup failed:", error);
+            }
+        };
+
+        // --- Whiteboard Logic ---
+        const initWhiteboard = (db, appId, userId) => {
+            const canvas = document.getElementById('whiteboardCanvas');
+            const ctx = canvas.getContext('2d');
+
+            if (!ctx) {
+                console.error("Failed to get 2D context for canvas.");
+                return;
+            }
+
+            const colorPicker = document.getElementById('colorPicker');
+            const sizeSlider = document.getElementById('sizeSlider');
+            const clearButton = document.getElementById('clearButton');
+            const eraseButton = document.getElementById('eraseButton');
+            const statusDiv = document.getElementById('loading-status');
+            const boardContainer = document.getElementById('boardContainer');
+
+            statusDiv.classList.add('hidden');
+            boardContainer.classList.remove('hidden');
+
+            let drawing = false;
+            let isErasing = false;
+            let lastPoint = null;
+            let currentStroke = [];
+            let strokesData = {}; // Stores all strokes for persistent drawing
+
+            let currentColor = colorPicker.value;
+            let currentSize = parseInt(sizeSlider.value, 10);
+            let clearTimer = null; // Used for the two-click confirmation logic
+
+            // Path to public data collection (collaborative)
+            const DRAWINGS_COLLECTION_PATH = `/artifacts/${appId}/public/data/drawings`;
+            // Path to a single control document to manage board clearing
+            const CONTROL_DOC_PATH = `/artifacts/${appId}/public/data/control/board_state`;
+
+            // --- Utility Functions ---
+
+            // Function to generate the trash icon SVG
+            const getTrashIcon = () => `
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="3 6 5 6 21 6"></polyline>
+$<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>$
+                </svg>
+            `;
+
+            // Function to reset the clear button to its default hidden state
+            const resetClearButton = () => {
+                clearButton.innerHTML = getTrashIcon();
+                clearButton.classList.remove('bg-red-500', 'text-white', 'hover:bg-red-600', 'shadow-md', 'w-20');
+                clearButton.classList.add('text-gray-400', 'hover:text-red-500', 'hover:bg-red-50', 'w-10');
+            };
+
+            // --- Canvas Utility Functions ---
+
+            const resizeCanvas = () => {
+                const container = canvas.parentElement;
+                // Set the canvas size based on its container, which is responsive (w-full, h-full)
+                canvas.width = container.clientWidth;
+                canvas.height = container.clientHeight;
+                redrawAllStrokes(); // Redraw everything on resize
+                // console.log(`Canvas resized to: ${canvas.width}x${canvas.height}`);
+            };
+
+            // Initial resize and listener for window resize
+            resizeCanvas();
+            window.addEventListener('resize', resizeCanvas);
+
+            const getPoint = (e) => {
+                const rect = canvas.getBoundingClientRect();
+                let clientX, clientY;
+
+                // Handle touch events
+                if (e.touches && e.touches.length > 0) {
+                    clientX = e.touches[0].clientX;
+                    clientY = e.touches[0].clientY;
+                } else {
+                    clientX = e.clientX;
+                    clientY = e.clientY;
+                }
+
+                // Calculate relative coordinates
+                const x = clientX - rect.left;
+                const y = clientY - rect.top;
+
+                // Normalize coordinates to percentage of current canvas size
+                const normalizedX = x / canvas.width;
+                const normalizedY = y / canvas.height;
+
+                return { x, y, normalizedX, normalizedY };
+            };
+
+            const drawLine = (p1, p2, color, size) => {
+                ctx.beginPath();
+                ctx.moveTo(p1.x, p1.y);
+                ctx.lineTo(p2.x, p2.y);
+                ctx.strokeStyle = color;
+                ctx.lineWidth = size;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.stroke();
+            };
+
+            const redrawAllStrokes = () => {
+                // Clear the entire canvas
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                // Check for last cleared time
+                const lastClearedTime = strokesData.lastClearedAt || 0;
+
+                // Iterate over all stored strokes and redraw them
+                Object.values(strokesData)
+                    .filter(stroke => stroke.timestamp && stroke.timestamp > lastClearedTime)
+                    .sort((a, b) => a.timestamp - b.timestamp) // Sort by timestamp for correct rendering order
+                    .forEach(stroke => {
+                        if (stroke.points && stroke.points.length > 1) {
+                            for (let i = 1; i < stroke.points.length; i++) {
+                                const p1Norm = stroke.points[i - 1];
+                                const p2Norm = stroke.points[i];
+                                
+                                // Denormalize points to current canvas coordinates
+                                const p1 = { x: p1Norm.normalizedX * canvas.width, y: p1Norm.normalizedY * canvas.height };
+                                const p2 = { x: p2Norm.normalizedX * canvas.width, y: p2Norm.normalizedY * canvas.height };
+
+                                // Use background color for erasing, or the stroke's color
+                                const color = stroke.isErasing ? '#ffffff' : stroke.color;
+
+                                drawLine(p1, p2, color, stroke.size);
+                            }
+                        }
+                    });
+            };
+
+            // --- Input Handlers ---
+
+            const startDrawing = (e) => {
+                e.preventDefault();
+                // If a clear confirmation is pending, cancel it
+                if (clearTimer) {
+                    clearTimeout(clearTimer);
+                    clearTimer = null;
+                    resetClearButton();
+                }
+
+                drawing = true;
+                currentStroke = [];
+                lastPoint = getPoint(e);
+                currentStroke.push(lastPoint);
+            };
+
+            const draw = (e) => {
+                if (!drawing) return;
+                e.preventDefault();
+                const newPoint = getPoint(e);
+
+                // --- DIAGNOSTIC LOG ---
+                // If you see these logs, the drawing events are firing correctly.
+                // The issue might be visual (color, size, coordinates).
+                console.log("Attempting to draw line segment...");
+
+                // Draw the line segment locally
+                const color = isErasing ? '#ffffff' : currentColor;
+                drawLine(lastPoint, newPoint, color, currentSize);
+
+                // Store the normalized point for Firestore upload
+                currentStroke.push(newPoint);
+                lastPoint = newPoint;
+            };
+
+            const stopDrawing = () => {
+                if (!drawing) return;
+                drawing = false;
+
+                // Only save the stroke if it has more than one point (a line segment)
+                if (currentStroke.length > 1) {
+                    saveStrokeToFirestore(currentStroke);
+                }
+                currentStroke = [];
+                lastPoint = null;
+            };
+
+            // --- Firestore Operations ---
+
+            const saveStrokeToFirestore = async (points) => {
+                try {
+                    // Extract only the normalized coordinates and properties needed for storage
+                    const normalizedPoints = points.map(p => ({
+                        normalizedX: p.normalizedX,
+                        normalizedY: p.normalizedY
+                    }));
+
+                    await addDoc(collection(db, DRAWINGS_COLLECTION_PATH), {
+                        color: currentColor,
+                        size: currentSize,
+                        isErasing: isErasing,
+                        points: normalizedPoints,
+                        userId: userId,
+                        timestamp: serverTimestamp()
+                    });
+                } catch (error) {
+                    console.error("Error saving stroke to Firestore:", error);
+                }
+            };
+
+            const executeClearBoard = async () => {
+                try {
+                    // 1. Update the control document to signal a clear event
+                    await setDoc(doc(db, CONTROL_DOC_PATH), {
+                        lastClearedAt: Date.now(),
+                        clearInitiatorId: userId,
+                        timestamp: serverTimestamp()
+                    });
+
+                    // 2. Client-side deletion of all documents
+                    const q = query(collection(db, DRAWINGS_COLLECTION_PATH));
+                    const querySnapshot = await getDocs(q);
+
+                    querySnapshot.forEach(async (d) => {
+                        // Attempt to delete (relying on security rules to allow/deny)
+                        await deleteDoc(d.ref).catch(err => {
+                            // Suppress permission denied errors
+                            if (!err.code || err.code !== 'permission-denied') {
+                                console.warn("Could not delete stroke document (may be due to security rules):", err.message);
+                            }
+                        });
+                    });
+
+                } catch (error) {
+                    console.error("Error clearing board:", error);
+                }
+            };
+
+            // Handles the two-click confirmation logic
+            const handleClearBoardConfirmation = () => {
+                if (clearTimer) {
+                    // Second click: Execute clear
+                    clearTimeout(clearTimer);
+                    clearTimer = null;
+                    resetClearButton();
+                    executeClearBoard();
+
+                } else {
+                    // First click: Ask for confirmation
+                    clearButton.innerHTML = 'Confirm?';
+                    clearButton.classList.remove('text-gray-400', 'hover:text-red-500', 'hover:bg-red-50', 'w-10');
+                    clearButton.classList.add('bg-red-500', 'text-white', 'hover:bg-red-600', 'shadow-md', 'w-20');
+
+                    clearTimer = setTimeout(() => {
+                        // Timeout: Revert state if not clicked again
+                        resetClearButton();
+                        clearTimer = null;
+                    }, 3000); // 3 seconds to confirm
+                }
+            };
+
+            // --- Firestore Listeners ---
+
+            // 1. Listen for the Control Document (Clear Signal)
+            onSnapshot(doc(db, CONTROL_DOC_PATH), (docSnap) => {
+                if (docSnap.exists()) {
+                    const data = docSnap.data();
+                    strokesData.lastClearedAt = data.lastClearedAt;
+                    redrawAllStrokes();
+                } else {
+                    strokesData.lastClearedAt = 0; // No clear marker yet
+                }
+            });
+
+            // 2. Listen for the Drawings Collection
+            onSnapshot(collection(db, DRAWINGS_COLLECTION_PATH), (snapshot) => {
+                let hasChanges = false;
+
+                snapshot.docChanges().forEach(change => {
+                    const docId = change.doc.id;
+                    const data = change.doc.data();
+
+                    // Normalize timestamp for consistent sorting/filtering
+                    const timestamp = data.timestamp ? data.timestamp.toMillis() : Date.now();
+
+                    if (change.type === "added" || change.type === "modified") {
+                        strokesData[docId] = { ...data, timestamp: timestamp };
+                        hasChanges = true;
+                    } else if (change.type === "removed") {
+                        delete strokesData[docId];
+                        hasChanges = true;
+                    }
+                });
+
+                if (hasChanges) {
+                    redrawAllStrokes();
+                }
+            });
+
+            // --- UI/Event Listeners ---
+
+            canvas.addEventListener('mousedown', startDrawing);
+            canvas.addEventListener('mousemove', draw);
+            document.addEventListener('mouseup', stopDrawing);
+
+            canvas.addEventListener('touchstart', startDrawing, { passive: false });
+            canvas.addEventListener('touchmove', draw, { passive: false });
+            document.addEventListener('touchend', stopDrawing);
+
+            colorPicker.addEventListener('change', (e) => {
+                currentColor = e.target.value;
+                isErasing = false; // Turn off eraser when color is picked
+                eraseButton.classList.remove('bg-indigo-700', 'text-white');
+                eraseButton.classList.add('bg-gray-200', 'text-gray-800');
+            });
+
+            sizeSlider.addEventListener('input', (e) => {
+                currentSize = parseInt(e.target.value, 10);
+            });
+
+            eraseButton.addEventListener('click', () => {
+                isErasing = !isErasing;
+                if (isErasing) {
+                    eraseButton.classList.add('bg-indigo-700', 'text-white');
+                    eraseButton.classList.remove('bg-gray-200', 'text-gray-800');
+                } else {
+                    eraseButton.classList.remove('bg-indigo-700', 'text-white');
+                    eraseButton.classList.add('bg-gray-200', 'text-gray-800');
+                }
+            });
+
+            clearButton.addEventListener('click', handleClearBoardConfirmation);
+
+            // Initialize button state
+            resetClearButton();
+        };
+
+        // Start the application setup
+        setupFirebase();
+
+    </script>
+    <style>
+        /* Custom CSS for a better canvas experience */
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            overflow: hidden; /* Prevent body scroll */
+        }
+        #boardContainer {
+            touch-action: none; /* Crucial: Prevents default browser actions like scrolling/zoom */
+            height: calc(100vh - 8rem); /* 100vh minus the height of the controls area */
+        }
+        #whiteboardCanvas {
+            background-color: #ffffff;
+            cursor: crosshair;
+            display: block;
+            border: 1px solid #e5e7eb; /* Light border */
+        }
+    </style>
+</head>
+<body class="bg-gray-50 flex flex-col h-screen">
+
+    <!-- Loading Status -->
+    <div id="loading-status" class="flex items-center justify-center h-full text-xl text-indigo-600">
+        <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 
