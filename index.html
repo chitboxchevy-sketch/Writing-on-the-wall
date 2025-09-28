@@ -9,6 +9,7 @@
     <!-- Load Firebase/Firestore -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, getDocs, deleteDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
         import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
@@ -42,40 +43,50 @@
 
         // --- Firebase Setup ---
         const setupFirebase = async () => {
-            let db;
+            let db, auth;
             try {
-                // =========================================================================
-                // CONFIGURED WITH YOUR PROVIDED SDK VALUES
-                // =========================================================================
-                const FIREBASE_CONFIG = {
-                    apiKey: "AIzaSyBPJz07Qe86sjfYP18EwFRzZkbw3sBJaI0",
-                    authDomain: "writing-on-the-wall5656.firebaseapp.com",
-                    projectId: "writing-on-the-wall5656",
-                    storageBucket: "writing-on-the-wall5656.firebasestorage.app",
-                    messagingSenderId: "668534703439",
-                    appId: "1:668534703439:web:f40e9f9952ae6647e0713a"
-                };
+                // --- MANDATORY: Use environment provided configurations ---
+                const firebaseConfig = typeof __firebase_config !== 'undefined'
+                    ? JSON.parse(__firebase_config)
+                    : null;
+                
+                if (!firebaseConfig) {
+                    throw new Error("Firebase configuration not found from environment.");
+                }
+                
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
 
-                const firebaseConfig = FIREBASE_CONFIG;
-                const appId = FIREBASE_CONFIG.projectId;
+                const appId = firebaseConfig.projectId || 'default-app-id'; // Use projectId as appId
                 
                 // Set Firestore logging to debug level
                 setLogLevel('Debug');
 
-                const app = initializeApp(firebaseConfig);
-                db = getFirestore(app);
+                // --- MANDATORY: Authentication using custom token or anonymous sign-in ---
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    console.log("Signing in with custom token...");
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    console.log("Signing in anonymously...");
+                    await signInAnonymously(auth);
+                }
+                
+                const userId = auth.currentUser?.uid || 'anonymous-user';
                 
                 // Store globals and initialize whiteboard
                 window.firebaseApp.db = db;
                 window.firebaseApp.appId = appId;
+                window.firebaseApp.userId = userId;
                 
+                // Initialize the whiteboard *after* successful authentication
                 initWhiteboard(db, appId);
                 handleUiState(true);
 
 
             } catch (error) {
                 console.error("CRITICAL Firebase setup failure:", error);
-                handleUiState(false, 'Setup Failed: ' + error.message);
+                handleUiState(false, 'Setup Failed: ' + error.message + '. Please ensure Firebase Auth is enabled for your project.');
             }
         };
 
